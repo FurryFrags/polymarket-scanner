@@ -7,7 +7,7 @@
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; background: #f9f9f9; line-height: 1.45; }
     #log { height: 520px; overflow-y: auto; border: 1px solid #ccc; padding: 12px; background: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; }
-    input, button { margin: 8px 0; padding: 10px; font-size: 16px; width: 100%; box-sizing: border-box; }
+    input, select, button { margin: 8px 0; padding: 10px; font-size: 16px; width: 100%; box-sizing: border-box; }
     button { background: #0052FF; color: #fff; border: none; cursor: pointer; border-radius: 8px; }
     button:disabled { background: #aaa; cursor: not-allowed; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -60,6 +60,17 @@
     <input id="threshold" type="number" step="0.001" value="0.01" />
     <label>Max USDC budget per trade (estimate only):</label>
     <input id="maxAmount" type="number" value="100" />
+    <label>Fee model:</label>
+    <select id="feeModel">
+      <option value="taker" selected>Taker</option>
+      <option value="maker">Maker</option>
+    </select>
+    <label>Taker fee (bps):</label>
+    <input id="takerFeeBps" type="number" min="0" step="1" value="50" />
+    <label>Maker fee (bps):</label>
+    <input id="makerFeeBps" type="number" min="0" step="1" value="0" />
+    <label>Fallback minimum order size (if market missing min size):</label>
+    <input id="minSize" type="number" min="0" step="0.01" value="1" />
     <label>Trade slippage allowance (0.01 = 1%):</label>
     <input id="slippage" type="number" step="0.001" value="0.01" />
   </div>
@@ -151,6 +162,111 @@
       }
     }
     return null;
+  }
+
+  function parseFiniteNumber(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function getMarketMinSize(market, fallbackMinSize) {
+    const candidates = [
+      market?.min_size,
+      market?.minSize,
+      market?.minimum_size,
+      market?.minimumSize,
+      market?.min_order_size,
+      market?.minOrderSize,
+      market?.order_min_size,
+      market?.orderMinSize
+    ];
+    for (const c of candidates) {
+      const n = parseFiniteNumber(c);
+      if (n != null && n > 0) return n;
+    }
+    return fallbackMinSize > 0 ? fallbackMinSize : 0;
+  }
+
+  function getTickSize(market) {
+    const candidates = [
+      market?.tick_size,
+      market?.tickSize,
+      market?.min_tick_size,
+      market?.minTickSize,
+      market?.price_tick_size,
+      market?.priceTickSize
+    ];
+    for (const c of candidates) {
+      const n = parseFiniteNumber(c);
+      if (n != null && n > 0) return n;
+    }
+    return null;
+  }
+
+  function roundDownToTick(size, tickSize) {
+    if (!(tickSize > 0)) return size;
+    const factor = Math.floor(size / tickSize + 1e-12);
+    return Math.max(0, factor * tickSize);
+  }
+
+  function normalizeAsks(rawAsks) {
+    const asks = Array.isArray(rawAsks) ? rawAsks : [];
+    return asks
+      .map(a => ({
+        price: parseFiniteNumber(a?.price),
+        size: parseFiniteNumber(a?.size)
+      }))
+      .filter(a => a.price != null && a.size != null && a.price > 0 && a.size > 0)
+      .sort((a, b) => a.price - b.price);
+  }
+
+  function summarizeDepth(asks) {
+    return asks.reduce((sum, level) => sum + level.size, 0);
+  }
+
+  function costForSize(asks, targetSize) {
+    if (targetSize <= 0) return null;
+    let remaining = targetSize;
+    let cost = 0;
+    let worstPrice = 0;
+    for (const level of asks) {
+      if (remaining <= 1e-9) break;
+      const take = Math.min(remaining, level.size);
+      cost += take * level.price;
+      remaining -= take;
+      worstPrice = level.price;
+    }
+    if (remaining > 1e-6) return null;
+    return {
+      cost,
+      avgPrice: cost / targetSize,
+      worstPrice
+    };
+  }
+
+  function maxSizeWithinBudget(asksYes, asksNo, budget, maxSize) {
+    let low = 0;
+    let high = maxSize;
+    for (let i = 0; i < 40; i += 1) {
+      const mid = (low + high) / 2;
+      if (mid <= 0) {
+        low = 0;
+        break;
+      }
+      const yesCost = costForSize(asksYes, mid);
+      const noCost = costForSize(asksNo, mid);
+      if (!yesCost || !noCost) {
+        high = mid;
+        continue;
+      }
+      const totalCost = yesCost.cost + noCost.cost;
+      if (totalCost <= budget) {
+        low = mid;
+      } else {
+        high = mid;
+      }
+    }
+    return low;
   }
 
   async function detectCoinbaseProvider(timeoutMs = 400) {
@@ -362,6 +478,11 @@
     const marketLimit = Math.max(10, Math.min(300, Number(document.getElementById("marketLimit").value) || 200));
     const threshold = Number(document.getElementById("threshold").value) || 0.01;
     const maxAmount = Number(document.getElementById("maxAmount").value) || 100;
+    const feeModel = document.getElementById("feeModel").value;
+    const makerFeeBps = Math.max(0, Number(document.getElementById("makerFeeBps").value) || 0);
+    const takerFeeBps = Math.max(0, Number(document.getElementById("takerFeeBps").value) || 0);
+    const fallbackMinSize = Math.max(0, Number(document.getElementById("minSize").value) || 0);
+    const feeRate = (feeModel === "maker" ? makerFeeBps : takerFeeBps) / 10000;
 
     // 1) Markets (Gamma)
     const markets = await apiFetch(`/api/gamma/markets?limit=${encodeURIComponent(marketLimit)}&active=true&closed=false`, { method: "GET" });
@@ -411,66 +532,126 @@
       return;
     }
 
-    const bestAsk = new Map();
+    const orderbooks = new Map();
     for (const b of books) {
       const asset = String(b?.asset_id || "");
-      const asks = Array.isArray(b?.asks) ? b.asks : [];
-      if (!asset || asks.length === 0) continue;
-      const a0 = asks[0];
-      const price = Number(a0?.price);
-      const size  = Number(a0?.size);
-      if (Number.isFinite(price) && Number.isFinite(size) && size > 0) {
-        bestAsk.set(asset, { price, size });
-      }
+      if (!asset) continue;
+      const asks = normalizeAsks(b?.asks);
+      if (asks.length === 0) continue;
+      orderbooks.set(asset, asks);
     }
 
     // 4) Compute arbs
-    const opps = [];
+    const theoreticalOpps = [];
+    const executableOpps = [];
     for (const m of picked) {
-      const y = bestAsk.get(m.yes);
-      const n = bestAsk.get(m.no);
-      if (!y || !n) continue;
+      const asksYes = orderbooks.get(m.yes);
+      const asksNo = orderbooks.get(m.no);
+      if (!asksYes || !asksNo) continue;
+      const bestYes = asksYes[0];
+      const bestNo = asksNo[0];
+      if (!bestYes || !bestNo) continue;
 
-      const sum = y.price + n.price;
-      if (!(sum > 0 && sum < 2)) continue;
+      const bestSum = bestYes.price + bestNo.price;
+      if (!(bestSum > 0 && bestSum < 2)) continue;
 
-      const margin = 1 - sum;
+      const bestMargin = 1 - bestSum;
+      if (bestMargin < threshold) continue;
+
+      let theoreticalSize = Math.min(bestYes.size, bestNo.size);
+      theoreticalSize = Math.min(theoreticalSize, maxAmount / bestSum);
+      if (theoreticalSize > 0) {
+        const theoreticalCost = theoreticalSize * bestSum;
+        const theoreticalGross = theoreticalSize - theoreticalCost;
+        const theoreticalFee = theoreticalCost * feeRate;
+        const theoreticalNet = theoreticalGross - theoreticalFee;
+        if (theoreticalNet > 0) {
+          theoreticalOpps.push({
+            q: m.q,
+            marketId: m.id,
+            yes: m.yes,
+            no: m.no,
+            ay: bestYes.price,
+            an: bestNo.price,
+            size: theoreticalSize,
+            net: theoreticalNet,
+            margin: bestMargin
+          });
+        }
+      }
+
+      const totalYesDepth = summarizeDepth(asksYes);
+      const totalNoDepth = summarizeDepth(asksNo);
+      const depthLimit = Math.min(totalYesDepth, totalNoDepth);
+      if (!(depthLimit > 0)) continue;
+
+      const maxByBudget = maxSizeWithinBudget(asksYes, asksNo, maxAmount, depthLimit);
+      if (!(maxByBudget > 0)) continue;
+
+      const minSize = getMarketMinSize(m, fallbackMinSize);
+      const tickSize = getTickSize(m);
+      let size = maxByBudget;
+      const roundedSize = roundDownToTick(size, tickSize);
+      const rounded = roundedSize !== size;
+      size = roundedSize;
+      if (!(size > 0)) continue;
+      if (minSize > 0 && size < minSize) continue;
+
+      const yesFill = costForSize(asksYes, size);
+      const noFill = costForSize(asksNo, size);
+      if (!yesFill || !noFill) continue;
+
+      const cost = yesFill.cost + noFill.cost;
+      const avgSum = cost / size;
+      const margin = 1 - avgSum;
       if (margin < threshold) continue;
 
-      let size = Math.min(y.size, n.size);
-      size = Math.min(size, maxAmount / sum);
-      if (size <= 0) continue;
-
-      const cost = size * sum;
       const gross = size - cost;
-
-      // Fee estimate placeholder. Real fees depend on venue + maker/taker.
-      const feeApprox = cost * 0.005;
-      const net = gross - feeApprox;
+      const fee = cost * feeRate;
+      const net = gross - fee;
       if (net <= 0) continue;
 
-      opps.push({
+      executableOpps.push({
         q: m.q,
         marketId: m.id,
         yes: m.yes,
         no: m.no,
-        ay: y.price,
-        an: n.price,
+        ay: yesFill.worstPrice,
+        an: noFill.worstPrice,
+        ayAvg: yesFill.avgPrice,
+        anAvg: noFill.avgPrice,
         size,
         net,
-        margin
+        margin,
+        rounded,
+        tickSize,
+        minSize
       });
     }
 
-    if (opps.length === 0) {
-      log(`No arbs this scan. (checked ${picked.length} markets / ${tokenIds.length} tokens)`);
+    if (theoreticalOpps.length === 0) {
+      log(`No theoretical arbs this scan. (checked ${picked.length} markets / ${tokenIds.length} tokens)`);
+    } else {
+      theoreticalOpps.sort((a, b) => b.net - a.net);
+      const bestTheoretical = theoreticalOpps[0];
+      log(`BEST THEORETICAL: "${bestTheoretical.q.slice(0, 80)}${bestTheoretical.q.length > 80 ? "…" : ""}" | ${(bestTheoretical.margin * 100).toFixed(2)}% margin | ~${bestTheoretical.net.toFixed(2)} USDC net est`);
+    }
+
+    if (executableOpps.length === 0) {
+      log(`No executable arbs this scan. (checked ${picked.length} markets / ${tokenIds.length} tokens)`);
+      lastBestOpportunity = null;
+      bestSummaryEl.textContent = "None yet";
       return;
     }
 
-    opps.sort((a, b) => b.net - a.net);
-    const best = opps[0];
+    executableOpps.sort((a, b) => b.net - a.net);
+    const best = executableOpps[0];
 
-    log(`BEST: "${best.q.slice(0, 80)}${best.q.length > 80 ? "…" : ""}" | ${(best.margin * 100).toFixed(2)}% margin | ~${best.net.toFixed(2)} USDC net est`);
+    const roundNote = best.rounded && best.tickSize
+      ? ` | rounded to tick ${best.tickSize}`
+      : "";
+    const minNote = best.minSize > 0 ? ` | min size ${best.minSize}` : "";
+    log(`BEST EXECUTABLE: "${best.q.slice(0, 80)}${best.q.length > 80 ? "…" : ""}" | ${(best.margin * 100).toFixed(2)}% margin | ~${best.net.toFixed(2)} USDC net est${roundNote}${minNote}`);
     lastBestOpportunity = best;
     bestSummaryEl.textContent = `${best.q.slice(0, 60)}${best.q.length > 60 ? "…" : ""} | ${(best.margin * 100).toFixed(2)}%`;
     // Track estimate
