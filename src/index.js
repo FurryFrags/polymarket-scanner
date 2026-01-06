@@ -17,6 +17,10 @@ export default {
       return handleTradeExecute(request, env);
     }
 
+    if (url.pathname === "/api/health") {
+      return handleHealth(request, env);
+    }
+
     if (!env?.ASSETS || typeof env.ASSETS.fetch !== "function") {
       return jsonResponse(
         {
@@ -99,6 +103,84 @@ async function handleClob(request, url) {
       "POST",
       "OPTIONS",
     ]);
+  }
+}
+
+async function handleHealth(request, env) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: corsHeaders(["GET", "OPTIONS"]),
+    });
+  }
+
+  if (request.method !== "GET") {
+    return jsonResponse({ error: "Method not allowed" }, 405, [
+      "GET",
+      "OPTIONS",
+    ]);
+  }
+
+  const requiredForTrade = [
+    "POLYMARKET_PRIVATE_KEY",
+    "POLYMARKET_API_KEY",
+    "POLYMARKET_API_SECRET",
+    "POLYMARKET_API_PASSPHRASE",
+  ];
+
+  const missing = requiredForTrade.filter((key) => !env?.[key]);
+
+  const envStatus = {
+    ok: missing.length === 0,
+    missing,
+    required: requiredForTrade,
+  };
+
+  const [gammaStatus, clobStatus] = await Promise.all([
+    checkUpstream("Gamma", "https://gamma-api.polymarket.com/health"),
+    checkUpstream("CLOB", "https://clob.polymarket.com/ok"),
+  ]);
+
+  const ok = gammaStatus.ok && clobStatus.ok && envStatus.ok;
+
+  return jsonResponse(
+    {
+      ok,
+      timestamp: new Date().toISOString(),
+      upstream: {
+        gamma: gammaStatus,
+        clob: clobStatus,
+      },
+      env: envStatus,
+    },
+    200,
+    ["GET", "OPTIONS"]
+  );
+}
+
+async function checkUpstream(name, url) {
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        "user-agent": "cf-worker/healthcheck",
+      },
+    });
+    const body = await resp.text();
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      statusText: resp.statusText,
+      response: body.slice(0, 500),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      statusText: "FETCH_ERROR",
+      response: String(error?.message || error),
+    };
   }
 }
 

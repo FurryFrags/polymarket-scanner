@@ -37,6 +37,7 @@
   <div class="row">
     <button id="envBtn">1) Env check</button>
     <button id="apiBtn">2) Test API proxy</button>
+    <button id="healthBtn">Health</button>
   </div>
 
   <div class="row">
@@ -476,6 +477,30 @@
     }
   }
 
+  async function testHealth() {
+    setStatus("Checking health…");
+    try {
+      const health = await apiFetch("/api/health", { method: "GET" });
+      const gamma = health?.upstream?.gamma;
+      const clob = health?.upstream?.clob;
+      const missingEnv = health?.env?.missing || [];
+      const overall = health?.ok ? "OK" : "DEGRADED";
+
+      setStatus(`Health: ${overall}`);
+      log(`Health check: ${overall}`);
+      log(`Gamma: ${gamma?.ok ? "OK" : "FAIL"} (status ${gamma?.status ?? "n/a"})`);
+      log(`CLOB: ${clob?.ok ? "OK" : "FAIL"} (status ${clob?.status ?? "n/a"})`);
+      if (missingEnv.length) {
+        log(`Missing env vars: ${missingEnv.join(", ")}`);
+      } else {
+        log("Env vars: OK");
+      }
+    } catch (e) {
+      setStatus("Health check failed");
+      log(`Health check error: ${e?.message || e}`);
+    }
+  }
+
   function extractBinaryTokenIds(m) {
     // Prefer explicit tokens array if present
     if (Array.isArray(m?.tokens) && m.tokens.length >= 2) {
@@ -857,6 +882,7 @@
   });
 
   document.getElementById("apiBtn").addEventListener("click", testApiProxy);
+  document.getElementById("healthBtn").addEventListener("click", testHealth);
 
   document.getElementById("detectBtn").addEventListener("click", async () => {
     log("=== WALLET DETECTION ===");
