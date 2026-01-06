@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Polymarket Arb Scanner (Cloudflare Pages Proxy)</title>
+  <title>Polymarket Arb Scanner (Cloudflare Worker)</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; background: #f9f9f9; line-height: 1.45; }
     #log { height: 520px; overflow-y: auto; border: 1px solid #ccc; padding: 12px; background: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; }
@@ -22,8 +22,8 @@
 
   <div class="card warn">
     <b>Why this works:</b><br/>
-    Neocities CSP blocked direct Polymarket fetches. This version calls <code>/api/*</code> on the same origin (Cloudflare Pages),
-    and Pages Functions proxy to Polymarket server-side.
+    Neocities CSP blocked direct Polymarket fetches. This version calls <code>/api/*</code> on the same origin and a Cloudflare Worker
+    proxies requests server-side.
   </div>
 
   <div class="card">
@@ -60,6 +60,8 @@
     <input id="threshold" type="number" step="0.001" value="0.01" />
     <label>Max USDC budget per trade (estimate only):</label>
     <input id="maxAmount" type="number" value="100" />
+    <label>Trade slippage allowance (0.01 = 1%):</label>
+    <input id="slippage" type="number" step="0.001" value="0.01" />
   </div>
 
   <div class="row">
@@ -69,14 +71,30 @@
 
   <div class="card ok">
     <b>Total estimated profits tracked:</b> <span id="totalProfits">0.00</span> USDC
-    <br/><small>(Estimate only; this page does not place orders.)</small>
+    <br/><small>(Estimate only; trade execution is opt-in and defaults to paper mode.)</small>
+  </div>
+
+  <div class="card warn">
+    <b>Trade execution (server-side):</b>
+    <div><small>Live trading signs and submits orders from the server. Never enable live mode unless you are ready to trade.</small></div>
+    <label>
+      <input id="paperMode" type="checkbox" checked />
+      Paper trading mode (no live orders)
+    </label>
+    <label>
+      <input id="confirmTrade" type="checkbox" />
+      I understand this may place real orders and accept the risk
+    </label>
+    <div><b>Last best opportunity:</b> <span id="bestSummary">None yet</span></div>
+    <button id="executeBtn" disabled>Execute best arb (2 orders)</button>
+    <small id="tradeStatus">No trade submitted.</small>
   </div>
 
   <div id="log"></div>
 
 <script>
 (() => {
-  const BUILD = "cf-pages-proxy-2026-01-06";
+  const BUILD = "cf-worker-proxy-2026-01-06";
   const SCAN_INTERVAL_MS = 2000;
 
   const logEl = document.getElementById("log");
@@ -86,12 +104,18 @@
   const chainEl = document.getElementById("chain");
   const scanMsEl = document.getElementById("scanMs");
   const totalProfitsEl = document.getElementById("totalProfits");
+  const paperModeEl = document.getElementById("paperMode");
+  const confirmTradeEl = document.getElementById("confirmTrade");
+  const executeBtn = document.getElementById("executeBtn");
+  const tradeStatusEl = document.getElementById("tradeStatus");
+  const bestSummaryEl = document.getElementById("bestSummary");
 
   scanMsEl.textContent = String(SCAN_INTERVAL_MS);
 
   let eth = null;
   let connectedAddress = null;
   let interval = null;
+  let lastBestOpportunity = null;
   let totalProfits = Number(localStorage.getItem("totalProfits") || "0") || 0;
   totalProfitsEl.textContent = totalProfits.toFixed(2);
 
@@ -104,6 +128,13 @@
 
   function setStatus(s) { statusEl.textContent = s; }
   function setWalletStatus(s) { walletStatusEl.textContent = s; }
+
+  function updateTradeUiState() {
+    executeBtn.disabled = !confirmTradeEl.checked;
+    tradeStatusEl.textContent = paperModeEl.checked
+      ? "Paper mode enabled."
+      : "Live mode armed (requires confirmation).";
+  }
 
   function parseMaybeJson(v) {
     if (v == null) return null;
@@ -418,7 +449,17 @@
       const net = gross - feeApprox;
       if (net <= 0) continue;
 
-      opps.push({ q: m.q, yes: m.yes, no: m.no, ay: y.price, an: n.price, size, net, margin });
+      opps.push({
+        q: m.q,
+        marketId: m.id,
+        yes: m.yes,
+        no: m.no,
+        ay: y.price,
+        an: n.price,
+        size,
+        net,
+        margin
+      });
     }
 
     if (opps.length === 0) {
@@ -430,6 +471,8 @@
     const best = opps[0];
 
     log(`BEST: "${best.q.slice(0, 80)}${best.q.length > 80 ? "…" : ""}" | ${(best.margin * 100).toFixed(2)}% margin | ~${best.net.toFixed(2)} USDC net est`);
+    lastBestOpportunity = best;
+    bestSummaryEl.textContent = `${best.q.slice(0, 60)}${best.q.length > 60 ? "…" : ""} | ${(best.margin * 100).toFixed(2)}%`;
     // Track estimate
     totalProfits += best.net;
     totalProfitsEl.textContent = totalProfits.toFixed(2);
@@ -460,6 +503,66 @@
     document.getElementById("startBtn").disabled = false;
     document.getElementById("stopBtn").disabled = true;
     log("Scanning stopped");
+  }
+
+  async function executeBestTrade() {
+    if (!lastBestOpportunity) {
+      log("No best opportunity available yet.");
+      return;
+    }
+
+    if (!confirmTradeEl.checked) {
+      log("Trade confirmation checkbox not selected.");
+      return;
+    }
+
+    if (!paperModeEl.checked) {
+      const ok = window.confirm("You are about to place LIVE orders via the server. Continue?");
+      if (!ok) {
+        log("Live trade canceled by user.");
+        return;
+      }
+    }
+
+    const slippage = Number(document.getElementById("slippage").value) || 0;
+    const { marketId, yes, no, ay, an, size } = lastBestOpportunity;
+
+    const orders = [
+      { tokenId: yes, side: "buy", price: ay },
+      { tokenId: no, side: "buy", price: an }
+    ];
+
+    tradeStatusEl.textContent = "Submitting trade...";
+
+    for (const [index, order] of orders.entries()) {
+      const payload = {
+        marketId,
+        tokenId: order.tokenId,
+        side: order.side,
+        size,
+        price: order.price,
+        slippage,
+        paper: paperModeEl.checked,
+        clientOrderId: `arb-${Date.now()}-${index + 1}`
+      };
+
+      try {
+        const resp = await apiFetch("/api/trade/execute", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        log(`Trade response (${order.tokenId}): ${JSON.stringify(resp)}`);
+      } catch (e) {
+        log(`Trade failed (${order.tokenId}): ${e?.message || e}`);
+        tradeStatusEl.textContent = "Trade submission failed.";
+        return;
+      }
+    }
+
+    tradeStatusEl.textContent = paperModeEl.checked
+      ? "Paper trade logged."
+      : "Live trade submitted.";
   }
 
   // UI
@@ -501,11 +604,15 @@
 
   document.getElementById("startBtn").addEventListener("click", startScanning);
   document.getElementById("stopBtn").addEventListener("click", stopScanning);
+  executeBtn.addEventListener("click", executeBestTrade);
+  confirmTradeEl.addEventListener("change", updateTradeUiState);
+  paperModeEl.addEventListener("change", updateTradeUiState);
 
   // Boot
   setStatus("Ready");
   log(`Running build: ${BUILD}`);
   log(`Scan interval: ${SCAN_INTERVAL_MS}ms`);
+  updateTradeUiState();
 })();
 </script>
 </body>
