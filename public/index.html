@@ -1,1 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Polymarket Arb Scanner (Cloudflare Pages Proxy)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f9f9f9; line-height: 1.45; }
+    #log { height: 520px; overflow-y: auto; border: 1px solid #ccc; padding: 12px; background: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; }
+    input, button { margin: 8px 0; padding: 10px; font-size: 16px; width: 100%; box-sizing: border-box; }
+    button { background: #0052FF; color: #fff; border: none; cursor: pointer; border-radius: 8px; }
+    button:disabled { background: #aaa; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 10px; padding: 12px; margin: 12px 0; }
+    .warn { background:#fff2f2; border:1px solid #ffb3b3; }
+    .ok { background:#f2fff5; border:1px solid #b3ffc3; }
+    small { color:#444; }
+  </style>
+</head>
+<body>
+  <h1>Polymarket Arb Scanner (stable deployment)</h1>
 
+  <div class="card warn">
+    <b>Why this works:</b><br/>
+    Neocities CSP blocked direct Polymarket fetches. This version calls <code>/api/*</code> on the same origin (Cloudflare Pages),
+    and Pages Functions proxy to Polymarket server-side.
+  </div>
+
+  <div class="card">
+    <div><b>Status:</b> <span id="status">Booting…</span></div>
+    <div><b>Wallet:</b> <span id="walletStatus">Not connected</span></div>
+    <div><b>Address:</b> <span id="addr">—</span></div>
+    <div><b>Chain:</b> <span id="chain">—</span></div>
+    <div><b>Scan interval:</b> <span id="scanMs">2000</span> ms</div>
+  </div>
+
+  <div class="row">
+    <button id="envBtn">1) Env check</button>
+    <button id="apiBtn">2) Test API proxy</button>
+  </div>
+
+  <div class="row">
+    <button id="detectBtn">3) Detect Coinbase provider</button>
+    <button id="connectBtn">4) Connect Coinbase Wallet</button>
+  </div>
+
+  <div class="row">
+    <button id="repromptBtn">Re-prompt accounts</button>
+    <button id="disconnectBtn">Disconnect / Reset (UI)</button>
+  </div>
+
+  <div class="card">
+    <label>Market scan limit (default 200):</label>
+    <input id="marketLimit" type="number" min="10" max="300" step="10" value="200" />
+    <small>
+      200 markets ≈ 400 token_ids, under Polymarket <code>/books</code> max array length 500.
+    </small>
+    <br/><br/>
+    <label>Min profit margin threshold (0.01 = 1%):</label>
+    <input id="threshold" type="number" step="0.001" value="0.01" />
+    <label>Max USDC budget per trade (estimate only):</label>
+    <input id="maxAmount" type="number" value="100" />
+  </div>
+
+  <div class="row">
+    <button id="startBtn">Start scanning</button>
+    <button id="stopBtn" disabled>Stop scanning</button>
+  </div>
+
+  <div class="card ok">
+    <b>Total estimated profits tracked:</b> <span id="totalProfits">0.00</span> USDC
+    <br/><small>(Estimate only; this page does not place orders.)</small>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+(() => {
+  const BUILD = "cf-pages-proxy-2026-01-06";
+  const SCAN_INTERVAL_MS = 2000;
+
+  const logEl = document.getElementById("log");
+  const statusEl = document.getElementById("status");
+  const walletStatusEl = document.getElementById("walletStatus");
+  const addrEl = document.getElementById("addr");
+  const chainEl = document.getElementById("chain");
+  const scanMsEl = document.getElementById("scanMs");
+  const totalProfitsEl = document.getElementById("totalProfits");
+
+  scanMsEl.textContent = String(SCAN_INTERVAL_MS);
+
+  let eth = null;
+  let connectedAddress = null;
+  let interval = null;
+  let totalProfits = Number(localStorage.getItem("totalProfits") || "0") || 0;
+  totalProfitsEl.textContent = totalProfits.toFixed(2);
+
+  function log(msg) {
+    const ts = new Date().toLocaleTimeString();
+    logEl.textContent += `[${ts}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(msg);
+  }
+
+  function setStatus(s) { statusEl.textContent = s; }
+  function setWalletStatus(s) { walletStatusEl.textContent = s; }
+
+  function parseMaybeJson(v) {
+    if (v == null) return null;
+    if (Array.isArray(v)) return v;
+    if (typeof v === "string") {
+      const t = v.trim();
+      if (!t) return null;
+      try {
+        const j = JSON.parse(t);
+        return Array.isArray(j) ? j : null;
+      } catch {
+        // sometimes comma-separated
+        if (t.includes(",")) return t.split(",").map(x => x.trim()).filter(Boolean);
+      }
+    }
+    return null;
+  }
+
+  async function detectCoinbaseProvider(timeoutMs = 400) {
+    // Coinbase docs: multiprovider at window.ethereum.providers, identify via isCoinbaseWallet
+    // https://docs.cdp.coinbase.com/... :contentReference[oaicite:10]{index=10} (citation in assistant message, not inside code)
+    const w = window;
+
+    // 1) Legacy injected
+    if (w.ethereum) {
+      if (Array.isArray(w.ethereum.providers) && w.ethereum.providers.length) {
+        const cb = w.ethereum.providers.find(p => p && p.isCoinbaseWallet);
+        if (cb) return { provider: cb, via: "window.ethereum.providers" };
+      }
+      if (w.ethereum.isCoinbaseWallet) return { provider: w.ethereum, via: "window.ethereum" };
+    }
+
+    // 2) EIP-6963 announce/request (if available)
+    const discovered = [];
+    function onAnnounce(ev) {
+      try {
+        const d = ev.detail;
+        if (d && d.provider) discovered.push(d);
+      } catch {}
+    }
+
+    w.addEventListener("eip6963:announceProvider", onAnnounce);
+    try { w.dispatchEvent(new Event("eip6963:requestProvider")); } catch {}
+    await new Promise(r => setTimeout(r, timeoutMs));
+    w.removeEventListener("eip6963:announceProvider", onAnnounce);
+
+    // Prefer Coinbase-ish
+    const cb = discovered.find(x =>
+      x?.provider?.isCoinbaseWallet ||
+      String(x?.info?.name || "").toLowerCase().includes("coinbase")
+    );
+    if (cb?.provider) return { provider: cb.provider, via: "eip6963" };
+
+    return { provider: null, via: "none" };
+  }
+
+  function attachWalletListeners(p) {
+    if (!p || !p.on) return;
+
+    p.on("accountsChanged", (accounts) => {
+      log(`accountsChanged: ${JSON.stringify(accounts)}`);
+      if (Array.isArray(accounts) && accounts[0]) {
+        connectedAddress = accounts[0];
+        addrEl.textContent = connectedAddress;
+        setWalletStatus("Connected");
+      } else {
+        connectedAddress = null;
+        addrEl.textContent = "—";
+        setWalletStatus("Not connected");
+      }
+    });
+
+    p.on("chainChanged", (cid) => {
+      log(`chainChanged: ${cid}`);
+      chainEl.textContent = String(cid);
+    });
+  }
+
+  async function connectWallet() {
+    setStatus("Connecting wallet…");
+
+    const found = await detectCoinbaseProvider();
+    eth = found.provider;
+
+    if (!eth) {
+      setStatus("No Coinbase provider found");
+      log("No provider detected. Make sure Coinbase Wallet extension is installed/enabled on this HTTPS site.");
+      return;
+    }
+
+    log(`Using provider via: ${found.via}`);
+    attachWalletListeners(eth);
+
+    // Request accounts
+    log("Requesting accounts…");
+    const accounts = await eth.request({ method: "eth_requestAccounts" });
+    connectedAddress = (accounts && accounts[0]) ? accounts[0] : null;
+
+    const chainId = await eth.request({ method: "eth_chainId" });
+    chainEl.textContent = String(chainId);
+
+    if (connectedAddress) {
+      addrEl.textContent = connectedAddress;
+      setWalletStatus("Connected");
+      log(`Address: ${connectedAddress}`);
+    } else {
+      setWalletStatus("No accounts returned");
+      log("No accounts returned from eth_requestAccounts.");
+    }
+
+    // Try switch to Polygon (0x89)
+    if (chainId !== "0x89") {
+      log(`Wallet chainId=${chainId}; attempting switch to Polygon (0x89)`);
+      try {
+        await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x89" }] });
+        log("Switched to Polygon.");
+      } catch (e) {
+        // 4902: chain not added
+        if (e && e.code === 4902) {
+          log("Polygon not added; adding Polygon Mainnet…");
+          await eth.request({
+            method: "wallet_addEthereumChain",
+            params: [{
+              chainId: "0x89",
+              chainName: "Polygon Mainnet",
+              rpcUrls: ["https://polygon-rpc.com"],
+              nativeCurrency: { name: "MATIC", symbol: "MATIC", decimals: 18 },
+              blockExplorerUrls: ["https://polygonscan.com"]
+            }]
+          });
+          log("Added & switched to Polygon.");
+        } else {
+          log(`Chain switch failed: ${e?.message || e}`);
+        }
+      }
+    }
+
+    setStatus("Wallet ready");
+  }
+
+  function disconnectUiOnly() {
+    stopScanning();
+    eth = null;
+    connectedAddress = null;
+    addrEl.textContent = "—";
+    chainEl.textContent = "—";
+    setWalletStatus("Not connected");
+    setStatus("Reset complete");
+    log("Disconnected (UI reset). Note: EIP-1193 providers do not guarantee a programmatic 'disconnect'. If you need to revoke site access, do it in Coinbase Wallet extension → Connected sites.");
+  }
+
+  async function repromptAccounts() {
+    if (!eth) {
+      log("No provider selected yet. Click Detect/Connect first.");
+      return;
+    }
+    // Some wallets re-open the account chooser for this; some ignore.
+    try {
+      log("Requesting permissions re-prompt…");
+      await eth.request({
+        method: "wallet_requestPermissions",
+        params: [{ eth_accounts: {} }]
+      });
+      log("Permissions request sent. Now try Connect again if needed.");
+    } catch (e) {
+      log(`Re-prompt failed/unsupported: ${e?.message || e}`);
+    }
+  }
+
+  async function apiFetch(path, init) {
+    const url = new URL(path, location.origin).toString();
+    try {
+      const resp = await fetch(url, init);
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { data = text; }
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status} @ ${path} :: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+      }
+      return data;
+    } catch (e) {
+      throw new Error(`FETCH FAIL @ ${path} :: ${e?.message || e}`);
+    }
+  }
+
+  async function testApiProxy() {
+    setStatus("Testing API proxy…");
+    try {
+      const gamma = await apiFetch("/api/gamma/markets?limit=1&closed=false", { method: "GET" });
+      log(`Gamma OK. Type=${Array.isArray(gamma) ? "array" : typeof gamma}`);
+
+      const clob = await apiFetch("/api/clob/ok", { method: "GET" });
+      log(`CLOB OK response: ${typeof clob === "string" ? clob : JSON.stringify(clob)}`);
+
+      setStatus("API proxy OK");
+    } catch (e) {
+      setStatus("API proxy failed");
+      log(String(e?.message || e));
+    }
+  }
+
+  function extractBinaryTokenIds(m) {
+    // Prefer explicit tokens array if present
+    if (Array.isArray(m?.tokens) && m.tokens.length >= 2) {
+      const yes = m.tokens.find(t => String(t?.outcome).toLowerCase() === "yes")?.token_id;
+      const no  = m.tokens.find(t => String(t?.outcome).toLowerCase() === "no")?.token_id;
+      if (yes && no) return { yes: String(yes), no: String(no) };
+    }
+
+    // Else: map outcomes[] to clobTokenIds[]
+    const outcomes = parseMaybeJson(m?.outcomes);
+    const clobTokenIds = parseMaybeJson(m?.clobTokenIds);
+
+    if (Array.isArray(outcomes) && Array.isArray(clobTokenIds) && outcomes.length === 2 && clobTokenIds.length === 2) {
+      const iYes = outcomes.findIndex(x => String(x).toLowerCase() === "yes");
+      const iNo  = outcomes.findIndex(x => String(x).toLowerCase() === "no");
+      if (iYes >= 0 && iNo >= 0) {
+        return { yes: String(clobTokenIds[iYes]), no: String(clobTokenIds[iNo]) };
+      }
+    }
+    return null;
+  }
+
+  async function scanOnce() {
+    const marketLimit = Math.max(10, Math.min(300, Number(document.getElementById("marketLimit").value) || 200));
+    const threshold = Number(document.getElementById("threshold").value) || 0.01;
+    const maxAmount = Number(document.getElementById("maxAmount").value) || 100;
+
+    // 1) Markets (Gamma)
+    const markets = await apiFetch(`/api/gamma/markets?limit=${encodeURIComponent(marketLimit)}&active=true&closed=false`, { method: "GET" });
+    if (!Array.isArray(markets) || markets.length === 0) {
+      log(`No markets array returned. Type=${typeof markets}`);
+      return;
+    }
+
+    // 2) Collect binary markets + token ids
+    const picked = [];
+    const tokenIds = [];
+    for (const m of markets) {
+      const accepting = (m?.acceptingOrders ?? m?.accepting_orders ?? true);
+      if (!accepting) continue;
+
+      const pair = extractBinaryTokenIds(m);
+      if (!pair) continue;
+
+      picked.push({
+        id: m?.id,
+        q: String(m?.question || m?.title || m?.slug || "Unknown market"),
+        yes: pair.yes,
+        no: pair.no
+      });
+
+      tokenIds.push(pair.yes, pair.no);
+
+      // Keep under /books max 500 token_ids :contentReference[oaicite:11]{index=11} (citation in assistant message, not inside code)
+      if (tokenIds.length >= 500) break;
+    }
+
+    if (picked.length === 0) {
+      log("No binary Yes/No markets found in this batch.");
+      return;
+    }
+
+    // 3) Batch orderbooks (CLOB /books)
+    const body = tokenIds.slice(0, 500).map(tid => ({ token_id: String(tid) }));
+    const books = await apiFetch(`/api/clob/books`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+
+    if (!Array.isArray(books)) {
+      log(`CLOB /books unexpected response: ${typeof books}`);
+      return;
+    }
+
+    const bestAsk = new Map();
+    for (const b of books) {
+      const asset = String(b?.asset_id || "");
+      const asks = Array.isArray(b?.asks) ? b.asks : [];
+      if (!asset || asks.length === 0) continue;
+      const a0 = asks[0];
+      const price = Number(a0?.price);
+      const size  = Number(a0?.size);
+      if (Number.isFinite(price) && Number.isFinite(size) && size > 0) {
+        bestAsk.set(asset, { price, size });
+      }
+    }
+
+    // 4) Compute arbs
+    const opps = [];
+    for (const m of picked) {
+      const y = bestAsk.get(m.yes);
+      const n = bestAsk.get(m.no);
+      if (!y || !n) continue;
+
+      const sum = y.price + n.price;
+      if (!(sum > 0 && sum < 2)) continue;
+
+      const margin = 1 - sum;
+      if (margin < threshold) continue;
+
+      let size = Math.min(y.size, n.size);
+      size = Math.min(size, maxAmount / sum);
+      if (size <= 0) continue;
+
+      const cost = size * sum;
+      const gross = size - cost;
+
+      // Fee estimate placeholder. Real fees depend on venue + maker/taker.
+      const feeApprox = cost * 0.005;
+      const net = gross - feeApprox;
+      if (net <= 0) continue;
+
+      opps.push({ q: m.q, yes: m.yes, no: m.no, ay: y.price, an: n.price, size, net, margin });
+    }
+
+    if (opps.length === 0) {
+      log(`No arbs this scan. (checked ${picked.length} markets / ${tokenIds.length} tokens)`);
+      return;
+    }
+
+    opps.sort((a, b) => b.net - a.net);
+    const best = opps[0];
+
+    log(`BEST: "${best.q.slice(0, 80)}${best.q.length > 80 ? "…" : ""}" | ${(best.margin * 100).toFixed(2)}% margin | ~${best.net.toFixed(2)} USDC net est`);
+    // Track estimate
+    totalProfits += best.net;
+    totalProfitsEl.textContent = totalProfits.toFixed(2);
+    localStorage.setItem("totalProfits", String(totalProfits));
+  }
+
+  async function scanLoopTick() {
+    try {
+      await scanOnce();
+    } catch (e) {
+      log(String(e?.message || e));
+    }
+  }
+
+  function startScanning() {
+    stopScanning();
+    interval = setInterval(scanLoopTick, SCAN_INTERVAL_MS);
+    // run immediately too
+    scanLoopTick().catch(() => {});
+    document.getElementById("startBtn").disabled = true;
+    document.getElementById("stopBtn").disabled = false;
+    log(`Scanning started (${SCAN_INTERVAL_MS}ms)`);
+  }
+
+  function stopScanning() {
+    if (interval) clearInterval(interval);
+    interval = null;
+    document.getElementById("startBtn").disabled = false;
+    document.getElementById("stopBtn").disabled = true;
+    log("Scanning stopped");
+  }
+
+  // UI
+  document.getElementById("envBtn").addEventListener("click", () => {
+    log("=== ENV CHECK ===");
+    log(`build: ${BUILD}`);
+    log(`location.href: ${location.href}`);
+    log(`protocol: ${location.protocol}`);
+    log(`origin: ${location.origin}`);
+    log(`isSecureContext: ${window.isSecureContext}`);
+    log(`userAgent: ${navigator.userAgent}`);
+    log(`online: ${navigator.onLine}`);
+    log("=== END ===");
+  });
+
+  document.getElementById("apiBtn").addEventListener("click", testApiProxy);
+
+  document.getElementById("detectBtn").addEventListener("click", async () => {
+    log("=== WALLET DETECTION ===");
+    log(`Legacy window.ethereum present: ${!!window.ethereum}`);
+    log(`Legacy providers count: ${Array.isArray(window.ethereum?.providers) ? window.ethereum.providers.length : 0}`);
+
+    const found = await detectCoinbaseProvider();
+    log(`Best candidate: ${found.provider ? "Coinbase Wallet" : "none"} (via ${found.via})`);
+    log("=== END ===");
+  });
+
+  document.getElementById("connectBtn").addEventListener("click", async () => {
+    try {
+      await connectWallet();
+    } catch (e) {
+      log(`Connect error: ${e?.message || e}`);
+      setStatus("Connect failed");
+    }
+  });
+
+  document.getElementById("repromptBtn").addEventListener("click", repromptAccounts);
+  document.getElementById("disconnectBtn").addEventListener("click", disconnectUiOnly);
+
+  document.getElementById("startBtn").addEventListener("click", startScanning);
+  document.getElementById("stopBtn").addEventListener("click", stopScanning);
+
+  // Boot
+  setStatus("Ready");
+  log(`Running build: ${BUILD}`);
+  log(`Scan interval: ${SCAN_INTERVAL_MS}ms`);
+})();
+</script>
+</body>
+</html>
