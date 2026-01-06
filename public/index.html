@@ -107,6 +107,7 @@
 (() => {
   const BUILD = "cf-worker-proxy-2026-01-06";
   const SCAN_INTERVAL_MS = 2000;
+  const MAX_RATE_LIMIT_FAILURES = 3;
 
   const logEl = document.getElementById("log");
   const statusEl = document.getElementById("status");
@@ -128,6 +129,7 @@
   let interval = null;
   let lastBestOpportunity = null;
   let totalProfits = Number(localStorage.getItem("totalProfits") || "0") || 0;
+  let consecutiveRateLimitFailures = 0;
   totalProfitsEl.textContent = totalProfits.toFixed(2);
 
   function log(msg) {
@@ -420,20 +422,42 @@
     }
   }
 
-  async function apiFetch(path, init) {
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async function apiFetch(path, init, options = {}) {
     const url = new URL(path, location.origin).toString();
-    try {
-      const resp = await fetch(url, init);
-      const text = await resp.text();
-      let data = null;
-      try { data = JSON.parse(text); } catch { data = text; }
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status} @ ${path} :: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+    const retries = Number.isFinite(options.retries) ? options.retries : 3;
+    const baseDelayMs = Number.isFinite(options.baseDelayMs) ? options.baseDelayMs : 500;
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        const resp = await fetch(url, init);
+        const text = await resp.text();
+        let data = null;
+        try { data = JSON.parse(text); } catch { data = text; }
+        if (!resp.ok) {
+          const err = new Error(`HTTP ${resp.status} @ ${path} :: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+          err.status = resp.status;
+          err.isRateLimit = resp.status === 429;
+          err.isRetryable = resp.status === 429 || resp.status >= 500;
+          if (err.isRetryable && attempt < retries) {
+            const delay = Math.round(baseDelayMs * (2 ** attempt) * (0.75 + Math.random() * 0.5));
+            log(`Retrying ${path} in ${delay}ms (status ${resp.status}, attempt ${attempt + 1}/${retries})`);
+            await sleep(delay);
+            continue;
+          }
+          throw err;
+        }
+        return data;
+      } catch (e) {
+        if (e?.isRetryable || e?.status) {
+          throw e;
+        }
+        throw new Error(`FETCH FAIL @ ${path} :: ${e?.message || e}`);
       }
-      return data;
-    } catch (e) {
-      throw new Error(`FETCH FAIL @ ${path} :: ${e?.message || e}`);
     }
+    throw new Error(`FETCH FAIL @ ${path} :: exhausted retries`);
   }
 
   async function testApiProxy() {
@@ -474,6 +498,59 @@
     return null;
   }
 
+  async function fetchGammaMarketsPaginated(limit) {
+    const results = [];
+    const pageSize = Math.min(100, Math.max(10, limit));
+    let cursor = null;
+    let offset = 0;
+
+    while (results.length < limit) {
+      const remaining = limit - results.length;
+      const params = new URLSearchParams({
+        limit: String(Math.min(pageSize, remaining)),
+        active: "true",
+        closed: "false"
+      });
+      if (cursor) {
+        params.set("cursor", cursor);
+      } else {
+        params.set("offset", String(offset));
+      }
+
+      const page = await apiFetch(`/api/gamma/markets?${params.toString()}`, { method: "GET" });
+      let pageData = [];
+      let nextCursor = null;
+
+      if (Array.isArray(page)) {
+        pageData = page;
+      } else {
+        if (Array.isArray(page?.data)) {
+          pageData = page.data;
+        } else if (Array.isArray(page?.markets)) {
+          pageData = page.markets;
+        }
+        nextCursor = page?.next_cursor ?? page?.nextCursor ?? page?.cursor ?? page?.next ?? null;
+      }
+
+      if (pageData.length === 0) {
+        break;
+      }
+
+      results.push(...pageData);
+
+      if (nextCursor) {
+        cursor = nextCursor;
+      } else {
+        offset += pageData.length;
+        if (pageData.length < pageSize) {
+          break;
+        }
+      }
+    }
+
+    return results.slice(0, limit);
+  }
+
   async function scanOnce() {
     const marketLimit = Math.max(10, Math.min(300, Number(document.getElementById("marketLimit").value) || 200));
     const threshold = Number(document.getElementById("threshold").value) || 0.01;
@@ -485,7 +562,7 @@
     const feeRate = (feeModel === "maker" ? makerFeeBps : takerFeeBps) / 10000;
 
     // 1) Markets (Gamma)
-    const markets = await apiFetch(`/api/gamma/markets?limit=${encodeURIComponent(marketLimit)}&active=true&closed=false`, { method: "GET" });
+    const markets = await fetchGammaMarketsPaginated(marketLimit);
     if (!Array.isArray(markets) || markets.length === 0) {
       log(`No markets array returned. Type=${typeof markets}`);
       return;
@@ -663,13 +740,33 @@
   async function scanLoopTick() {
     try {
       await scanOnce();
+      if (consecutiveRateLimitFailures > 0) {
+        consecutiveRateLimitFailures = 0;
+        setStatus("Scan recovered");
+      }
     } catch (e) {
-      log(String(e?.message || e));
+      if (e?.isRateLimit || e?.status === 429) {
+        consecutiveRateLimitFailures += 1;
+        setStatus(`Rate limited (${consecutiveRateLimitFailures}/${MAX_RATE_LIMIT_FAILURES}). Retrying...`);
+        log(`Rate limit hit: ${e?.message || e}`);
+        if (consecutiveRateLimitFailures >= MAX_RATE_LIMIT_FAILURES) {
+          setStatus("Paused due to repeated rate limits. Click Start to resume.");
+          log("Pausing scanning after repeated rate limits.");
+          stopScanning();
+        }
+        return;
+      }
+      if (e?.status >= 500) {
+        log(`Server error: ${e?.message || e}`);
+      } else {
+        log(String(e?.message || e));
+      }
     }
   }
 
   function startScanning() {
     stopScanning();
+    consecutiveRateLimitFailures = 0;
     interval = setInterval(scanLoopTick, SCAN_INTERVAL_MS);
     // run immediately too
     scanLoopTick().catch(() => {});
