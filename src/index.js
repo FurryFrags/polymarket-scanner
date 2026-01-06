@@ -5,11 +5,11 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname.startsWith("/api/clob")) {
+    if (isApiRoute(url.pathname, "/api/clob")) {
       return handleClob(request, url);
     }
 
-    if (url.pathname.startsWith("/api/gamma")) {
+    if (isApiRoute(url.pathname, "/api/gamma")) {
       return handleGamma(request, url);
     }
 
@@ -316,6 +316,10 @@ function parsePath(pathname, prefix) {
     path: parts.join("/"),
     top: (parts[0] || "").toLowerCase(),
   };
+}
+
+function isApiRoute(pathname, base) {
+  return pathname === base || pathname.startsWith(`${base}/`);
 }
 
 function corsHeaders(methods) {
