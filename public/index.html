@@ -97,6 +97,19 @@
       <input id="confirmTrade" type="checkbox" />
       I understand this may place real orders and accept the risk
     </label>
+
+    <div style="margin-top:8px;">
+      <label>
+        <input id="autoExecute" type="checkbox" />
+        Auto-execute best arb when conditions met
+      </label>
+      <small>Auto-execute still respects the confirmation checkbox and paper mode toggle. Use with caution.</small>
+      <label>Min net (USDC) to auto-execute:</label>
+      <input id="minAutoNet" type="number" value="1" step="0.01" />
+      <label>Auto-execute cooldown (seconds):</label>
+      <input id="autoCooldownSec" type="number" value="30" min="1" />
+    </div>
+
     <div><b>Last best opportunity:</b> <span id="bestSummary">None yet</span></div>
     <button id="executeBtn" disabled>Execute best arb (2 orders)</button>
     <small id="tradeStatus">No trade submitted.</small>
@@ -122,6 +135,9 @@
   const executeBtn = document.getElementById("executeBtn");
   const tradeStatusEl = document.getElementById("tradeStatus");
   const bestSummaryEl = document.getElementById("bestSummary");
+  const autoExecuteEl = document.getElementById("autoExecute");
+  const minAutoNetEl = document.getElementById("minAutoNet");
+  const autoCooldownSecEl = document.getElementById("autoCooldownSec");
 
   scanMsEl.textContent = String(SCAN_INTERVAL_MS);
 
@@ -132,6 +148,10 @@
   let totalProfits = Number(localStorage.getItem("totalProfits") || "0") || 0;
   let consecutiveRateLimitFailures = 0;
   totalProfitsEl.textContent = totalProfits.toFixed(2);
+
+  // For auto-execution safety
+  let lastAutoExecutionKey = null;
+  let lastAutoExecutionAt = 0;
 
   function log(msg) {
     const ts = new Date().toLocaleTimeString();
@@ -172,16 +192,17 @@
     return Number.isFinite(n) ? n : null;
   }
 
-  function getMarketMinSize(market, fallbackMinSize) {
+  function getMarketMinSize(m, fallbackMinSize) {
     const candidates = [
       market?.min_size,
-      market?.minSize,
-      market?.minimum_size,
-      market?.minimumSize,
-      market?.min_order_size,
-      market?.minOrderSize,
-      market?.order_min_size,
-      market?.orderMinSize
+      m?.min_size,
+      m?.minSize,
+      m?.minimum_size,
+      m?.minimumSize,
+      m?.min_order_size,
+      m?.minOrderSize,
+      m?.order_min_size,
+      m?.orderMinSize
     ];
     for (const c of candidates) {
       const n = parseFiniteNumber(c);
@@ -273,11 +294,8 @@
   }
 
   async function detectCoinbaseProvider(timeoutMs = 400) {
-    // Coinbase docs: multiprovider at window.ethereum.providers, identify via isCoinbaseWallet
-    // https://docs.cdp.coinbase.com/... :contentReference[oaicite:10]{index=10} (citation in assistant message, not inside code)
     const w = window;
 
-    // 1) Legacy injected
     if (w.ethereum) {
       if (Array.isArray(w.ethereum.providers) && w.ethereum.providers.length) {
         const cb = w.ethereum.providers.find(p => p && p.isCoinbaseWallet);
@@ -286,7 +304,6 @@
       if (w.ethereum.isCoinbaseWallet) return { provider: w.ethereum, via: "window.ethereum" };
     }
 
-    // 2) EIP-6963 announce/request (if available)
     const discovered = [];
     function onAnnounce(ev) {
       try {
@@ -300,7 +317,6 @@
     await new Promise(r => setTimeout(r, timeoutMs));
     w.removeEventListener("eip6963:announceProvider", onAnnounce);
 
-    // Prefer Coinbase-ish
     const cb = discovered.find(x =>
       x?.provider?.isCoinbaseWallet ||
       String(x?.info?.name || "").toLowerCase().includes("coinbase")
@@ -347,7 +363,6 @@
     log(`Using provider via: ${found.via}`);
     attachWalletListeners(eth);
 
-    // Request accounts
     log("Requesting accounts…");
     const accounts = await eth.request({ method: "eth_requestAccounts" });
     connectedAddress = (accounts && accounts[0]) ? accounts[0] : null;
@@ -364,14 +379,12 @@
       log("No accounts returned from eth_requestAccounts.");
     }
 
-    // Try switch to Polygon (0x89)
     if (chainId !== "0x89") {
       log(`Wallet chainId=${chainId}; attempting switch to Polygon (0x89)`);
       try {
         await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x89" }] });
         log("Switched to Polygon.");
       } catch (e) {
-        // 4902: chain not added
         if (e && e.code === 4902) {
           log("Polygon not added; adding Polygon Mainnet…");
           await eth.request({
@@ -410,7 +423,6 @@
       log("No provider selected yet. Click Detect/Connect first.");
       return;
     }
-    // Some wallets re-open the account chooser for this; some ignore.
     try {
       log("Requesting permissions re-prompt…");
       await eth.request({
@@ -502,14 +514,12 @@
   }
 
   function extractBinaryTokenIds(m) {
-    // Prefer explicit tokens array if present
     if (Array.isArray(m?.tokens) && m.tokens.length >= 2) {
       const yes = m.tokens.find(t => String(t?.outcome).toLowerCase() === "yes")?.token_id;
       const no  = m.tokens.find(t => String(t?.outcome).toLowerCase() === "no")?.token_id;
       if (yes && no) return { yes: String(yes), no: String(no) };
     }
 
-    // Else: map outcomes[] to clobTokenIds[]
     const outcomes = parseMaybeJson(m?.outcomes);
     const clobTokenIds = parseMaybeJson(m?.clobTokenIds);
 
@@ -612,7 +622,6 @@
 
       tokenIds.push(pair.yes, pair.no);
 
-      // Keep under /books max 500 token_ids :contentReference[oaicite:11]{index=11} (citation in assistant message, not inside code)
       if (tokenIds.length >= 500) break;
     }
 
@@ -707,10 +716,8 @@
       const avgSum = cost / size;
       const margin = 1 - avgSum;
       if (margin < threshold) continue;
-
-      const gross = size - cost;
       const fee = cost * feeRate;
-      const net = gross - fee;
+      const net = (size - cost) - fee;
       if (net <= 0) continue;
 
       executableOpps.push({
@@ -736,7 +743,7 @@
     } else {
       theoreticalOpps.sort((a, b) => b.net - a.net);
       const bestTheoretical = theoreticalOpps[0];
-      log(`BEST THEORETICAL: "${bestTheoretical.q.slice(0, 80)}${bestTheoretical.q.length > 80 ? "…" : ""}" | ${(bestTheoretical.margin * 100).toFixed(2)}% margin | ~${bestTheoretical.net.toFixed(2)} USDC net est`);
+      log(`BEST THEORETICAL: "${bestTheoretical.q.slice(0, 80)}${bestTheoretical.q.length > 80 ? "…" : ""}" | ${(bestTheoretical.margin * 100).toFixed(2)}% margin | ~${bestTheoretical.net.toFixed(2)} USDC net (est)`);
     }
 
     if (executableOpps.length === 0) {
@@ -760,6 +767,59 @@
     totalProfits += best.net;
     totalProfitsEl.textContent = totalProfits.toFixed(2);
     localStorage.setItem("totalProfits", String(totalProfits));
+
+    // Try auto-execute if enabled and conditions met
+    tryAutoExecuteIfEnabled(best);
+  }
+
+  async function tryAutoExecuteIfEnabled(best) {
+    // Respect user's preference: autoExecute enabled and confirmation checked
+    if (!autoExecuteEl.checked) return;
+    if (!confirmTradeEl.checked) {
+      log("Auto-execute blocked: confirmation checkbox is not checked.");
+      return;
+    }
+
+    // If paper mode is enabled that's acceptable (auto paper trades are allowed), but still respect it.
+    // Check minimum net threshold
+    const minNet = Number(minAutoNetEl.value) || 0;
+    if ((best.net || 0) < minNet) {
+      log(`Auto-execute skipped: best net ${best.net?.toFixed(4) || 0} < minAutoNet ${minNet}`);
+      return;
+    }
+
+    // Build an id key for this opportunity to avoid duplicates
+    const key = `${best.marketId}:${best.yes}:${best.no}:${best.size.toFixed(8)}:${Math.round((best.net || 0)*100)}`;
+
+    // Cooldown
+    const cooldownSec = Math.max(1, Number(autoCooldownSecEl.value) || 30);
+    const now = Date.now();
+    if (lastAutoExecutionKey === key && (now - lastAutoExecutionAt) < cooldownSec * 1000) {
+      log(`Auto-execute suppressed: same opportunity within cooldown (${Math.round((now-lastAutoExecutionAt)/1000)}s)`);
+      return;
+    }
+
+    // Avoid executing if already recently executed a different opportunity too often
+    if ((now - lastAutoExecutionAt) < 1000) {
+      // last auto happened <1s ago — avoid immediate back-to-back
+      log("Auto-execute suppressed: very recent auto execution.");
+      return;
+    }
+
+    // All checks passed — perform auto-execution
+    log(`Auto-execute conditions met. Submitting best arb automatically (net ~${best.net.toFixed(4)} USDC).`);
+    // Mark the key now to avoid races while the async function runs
+    lastAutoExecutionKey = key;
+    lastAutoExecutionAt = now;
+
+    // Call execute, mark source so executeBestTrade can update states accordingly
+    try {
+      await executeBestTrade({ source: "auto" });
+    } catch (e) {
+      log(`Auto-execute failed: ${e?.message || e}`);
+      // reset key so future scans can attempt again
+      lastAutoExecutionKey = null;
+    }
   }
 
   async function scanLoopTick() {
@@ -808,7 +868,7 @@
     log("Scanning stopped");
   }
 
-  async function executeBestTrade() {
+  async function executeBestTrade(opts = { source: "manual" }) {
     if (!lastBestOpportunity) {
       log("No best opportunity available yet.");
       return;
@@ -819,12 +879,18 @@
       return;
     }
 
-    if (!paperModeEl.checked) {
+    if (!paperModeEl.checked && opts.source === "manual") {
       const ok = window.confirm("You are about to place LIVE orders via the server. Continue?");
       if (!ok) {
         log("Live trade canceled by user.");
         return;
       }
+    }
+
+    // For auto: if not paper mode, also ask the user to be sure (we avoid modal for auto).
+    if (!paperModeEl.checked && opts.source === "auto") {
+      // Do not open a modal in automated flow — require live armed + confirmTrade checked.
+      log("Auto-execute: Live mode is enabled; proceeding without modal because confirmation checkbox is set.");
     }
 
     const slippage = Number(document.getElementById("slippage").value) || 0;
@@ -859,16 +925,23 @@
       } catch (e) {
         log(`Trade failed (${order.tokenId}): ${e?.message || e}`);
         tradeStatusEl.textContent = "Trade submission failed.";
-        return;
+        throw e;
       }
     }
 
     tradeStatusEl.textContent = paperModeEl.checked
       ? "Paper trade logged."
       : "Live trade submitted.";
+
+    // Update auto-exec bookkeeping if this was an auto execution
+    if (opts.source === "auto" && lastBestOpportunity) {
+      lastAutoExecutionAt = Date.now();
+      lastAutoExecutionKey = `${lastBestOpportunity.marketId}:${lastBestOpportunity.yes}:${lastBestOpportunity.no}:${lastBestOpportunity.size.toFixed(8)}:${Math.round((lastBestOpportunity.net || 0)*100)}`;
+      log(`Auto-execution recorded (key=${lastAutoExecutionKey}).`);
+    }
   }
 
-  // UI
+  // UI bindings
   document.getElementById("envBtn").addEventListener("click", () => {
     log("=== ENV CHECK ===");
     log(`build: ${BUILD}`);
@@ -908,7 +981,7 @@
 
   document.getElementById("startBtn").addEventListener("click", startScanning);
   document.getElementById("stopBtn").addEventListener("click", stopScanning);
-  executeBtn.addEventListener("click", executeBestTrade);
+  executeBtn.addEventListener("click", () => executeBestTrade({ source: "manual" }));
   confirmTradeEl.addEventListener("change", updateTradeUiState);
   paperModeEl.addEventListener("change", updateTradeUiState);
 
