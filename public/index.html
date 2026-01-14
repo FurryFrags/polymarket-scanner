@@ -120,8 +120,9 @@
 <script>
 (() => {
   const BUILD = "cf-worker-proxy-2026-01-06";
-  const SCAN_INTERVAL_MS = 2000;
+  const SCAN_INTERVAL_MS = 200;
   const MAX_RATE_LIMIT_FAILURES = 3;
+  const NO_ARB_LOG_EVERY = 10;
 
   const logEl = document.getElementById("log");
   const statusEl = document.getElementById("status");
@@ -147,6 +148,8 @@
   let lastBestOpportunity = null;
   let totalProfits = Number(localStorage.getItem("totalProfits") || "0") || 0;
   let consecutiveRateLimitFailures = 0;
+  let consecutiveNoTheoretical = 0;
+  let consecutiveNoExecutable = 0;
   totalProfitsEl.textContent = totalProfits.toFixed(2);
 
   // For auto-execution safety
@@ -739,20 +742,34 @@
     }
 
     if (theoreticalOpps.length === 0) {
-      log(`No theoretical arbs this scan. (checked ${picked.length} markets / ${tokenIds.length} tokens)`);
+      consecutiveNoTheoretical += 1;
+      if (consecutiveNoTheoretical === 1 || consecutiveNoTheoretical % NO_ARB_LOG_EVERY === 0) {
+        log(`No theoretical arbs in last ${consecutiveNoTheoretical} scans. (checked ${picked.length} markets / ${tokenIds.length} tokens this scan)`);
+      }
     } else {
+      if (consecutiveNoTheoretical > 0) {
+        log(`Theoretical arbs found after ${consecutiveNoTheoretical} no-op scans.`);
+      }
+      consecutiveNoTheoretical = 0;
       theoreticalOpps.sort((a, b) => b.net - a.net);
       const bestTheoretical = theoreticalOpps[0];
       log(`BEST THEORETICAL: "${bestTheoretical.q.slice(0, 80)}${bestTheoretical.q.length > 80 ? "…" : ""}" | ${(bestTheoretical.margin * 100).toFixed(2)}% margin | ~${bestTheoretical.net.toFixed(2)} USDC net (est)`);
     }
 
     if (executableOpps.length === 0) {
-      log(`No executable arbs this scan. (checked ${picked.length} markets / ${tokenIds.length} tokens)`);
+      consecutiveNoExecutable += 1;
+      if (consecutiveNoExecutable === 1 || consecutiveNoExecutable % NO_ARB_LOG_EVERY === 0) {
+        log(`No executable arbs in last ${consecutiveNoExecutable} scans. (checked ${picked.length} markets / ${tokenIds.length} tokens this scan)`);
+      }
       lastBestOpportunity = null;
       bestSummaryEl.textContent = "None yet";
       return;
     }
 
+    if (consecutiveNoExecutable > 0) {
+      log(`Executable arb found after ${consecutiveNoExecutable} no-op scans.`);
+    }
+    consecutiveNoExecutable = 0;
     executableOpps.sort((a, b) => b.net - a.net);
     const best = executableOpps[0];
 
