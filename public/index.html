@@ -366,6 +366,16 @@
     log(`Using provider via: ${found.via}`);
     attachWalletListeners(eth);
 
+    try {
+      await eth.request({
+        method: "wallet_requestPermissions",
+        params: [{ eth_accounts: {} }]
+      });
+      log("Requested wallet permissions for eth_accounts.");
+    } catch (e) {
+      log(`Permissions request skipped/unsupported: ${e?.message || e}`);
+    }
+
     log("Requesting accounts…");
     const accounts = await eth.request({ method: "eth_requestAccounts" });
     connectedAddress = (accounts && accounts[0]) ? accounts[0] : null;
@@ -377,6 +387,7 @@
       addrEl.textContent = connectedAddress;
       setWalletStatus("Connected");
       log(`Address: ${connectedAddress}`);
+      localStorage.setItem(AUTO_CONNECT_KEY, "true");
     } else {
       setWalletStatus("No accounts returned");
       log("No accounts returned from eth_requestAccounts.");
@@ -418,6 +429,7 @@
     chainEl.textContent = "—";
     setWalletStatus("Not connected");
     setStatus("Reset complete");
+    localStorage.removeItem(AUTO_CONNECT_KEY);
     log("Disconnected (UI reset). Note: EIP-1193 providers do not guarantee a programmatic 'disconnect'. If you need to revoke site access, do it in Coinbase Wallet extension → Connected sites.");
   }
 
@@ -1002,11 +1014,39 @@
   confirmTradeEl.addEventListener("change", updateTradeUiState);
   paperModeEl.addEventListener("change", updateTradeUiState);
 
+  async function tryAutoConnect() {
+    if (localStorage.getItem(AUTO_CONNECT_KEY) !== "true") return;
+    const found = await detectCoinbaseProvider();
+    eth = found.provider;
+    if (!eth) {
+      log("Auto-connect skipped: no Coinbase provider detected.");
+      return;
+    }
+    attachWalletListeners(eth);
+    try {
+      const accounts = await eth.request({ method: "eth_accounts" });
+      connectedAddress = (accounts && accounts[0]) ? accounts[0] : null;
+      if (connectedAddress) {
+        const chainId = await eth.request({ method: "eth_chainId" });
+        chainEl.textContent = String(chainId);
+        addrEl.textContent = connectedAddress;
+        setWalletStatus("Connected (auto)");
+        setStatus("Wallet ready (auto)");
+        log("Auto-connected using previously granted permissions.");
+      } else {
+        log("Auto-connect: no authorized accounts returned.");
+      }
+    } catch (e) {
+      log(`Auto-connect failed: ${e?.message || e}`);
+    }
+  }
+
   // Boot
   setStatus("Ready");
   log(`Running build: ${BUILD}`);
   log(`Scan interval: ${SCAN_INTERVAL_MS}ms`);
   updateTradeUiState();
+  tryAutoConnect().catch(() => {});
 })();
 </script>
 </body>
